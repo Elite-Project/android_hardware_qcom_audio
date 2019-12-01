@@ -460,6 +460,12 @@ static void enable_gcov()
 }
 #endif
 
+#if ANDROID_PLATFORM_SDK_VERSION >= 29
+static int in_set_microphone_direction(const struct audio_stream_in *stream,
+                                           audio_microphone_direction_t dir);
+static int in_set_microphone_field_dimension(const struct audio_stream_in *stream, float zoom);
+#endif
+
 static bool may_use_noirq_mode(struct audio_device *adev, audio_usecase_t uc_id,
                                int flags __unused)
 {
@@ -2097,10 +2103,6 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
     struct stream_out stream_out;
     audio_usecase_t hfp_ucid;
     int status = 0;
-    audio_devices_t audio_device;
-    audio_channel_mask_t channel_mask;
-    int sample_rate;
-    int acdb_id;
 
     ALOGD("%s for use case (%s)", __func__, use_case_table[uc_id]);
 
@@ -2350,12 +2352,6 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
                     (usecase->stream.out->sample_rate < OUTPUT_SAMPLING_RATE_44100)) {
             usecase->stream.out->app_type_cfg.sample_rate = DEFAULT_OUTPUT_SAMPLING_RATE;
         }
-
-        /* Cache stream information to be notified to gef clients */
-        audio_device = usecase->stream.out->devices;
-        channel_mask = usecase->stream.out->channel_mask;
-        sample_rate = usecase->stream.out->app_type_cfg.sample_rate;
-        acdb_id = platform_get_snd_device_acdb_id(usecase->out_snd_device);
     }
     enable_audio_route(adev, usecase);
 
@@ -2411,16 +2407,6 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
                   out_standby_l(&usecase->stream.out->stream.common);
               }
          }
-    }
-
-    /* Notify device change info to effect clients registered
-     * NOTE: device lock has to be unlock temporarily here.
-     * To the worst case, we notify stale info to clients.
-     */
-    if (usecase->type == PCM_PLAYBACK) {
-        pthread_mutex_unlock(&adev->lock);
-        audio_extn_gef_notify_device_config(audio_device, channel_mask, sample_rate, acdb_id);
-        pthread_mutex_lock(&adev->lock);
     }
 
     ALOGD("%s: done",__func__);
@@ -3712,6 +3698,8 @@ static int out_standby(struct audio_stream *stream)
         if (do_stop) {
             stop_output_stream(out);
         }
+        // if fm is active route on selected device in UI
+        audio_extn_fm_route_on_selected_device(adev, out->devices);
         pthread_mutex_unlock(&adev->lock);
     }
     pthread_mutex_unlock(&out->lock);
@@ -4149,6 +4137,25 @@ error:
     ALOGV("%s: exit: code(%d)", __func__, ret);
     return ret;
 }
+
+#if ANDROID_PLATFORM_SDK_VERSION >= 29
+static int in_set_microphone_direction(const struct audio_stream_in *stream,
+                                           audio_microphone_direction_t dir) {
+    int ret_val = -ENOSYS;
+    (void)stream;
+    (void)dir;
+    ALOGV("---- in_set_microphone_direction()");
+    return ret_val;
+}
+
+static int in_set_microphone_field_dimension(const struct audio_stream_in *stream, float zoom) {
+    int ret_val = -ENOSYS;
+    (void)zoom;
+    (void)stream;
+    ALOGV("---- in_set_microphone_field_dimension()");
+    return ret_val;
+}
+#endif
 
 static bool stream_get_parameter_channels(struct str_parms *query,
                                           struct str_parms *reply,
@@ -4829,10 +4836,6 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
                 int16_t *src = (int16_t *)buffer;
                 int16_t *dst = (int16_t *)buffer;
 
-                LOG_ALWAYS_FATAL_IF(out->config.channels != 1 || channel_count != 2 ||
-                                    out->format != AUDIO_FORMAT_PCM_16_BIT,
-                                    "out_write called for incall music use case with wrong properties");
-
                 /*
                  * FIXME: this can be removed once audio flinger mixer supports
                  * mono output
@@ -4842,12 +4845,13 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
                  * Code below goes over each frame in the buffer and adds both
                  * L and R samples and then divides by 2 to convert to mono
                  */
-                for (size_t i = 0; i < frames ; i++, dst++, src += 2) {
-                    *dst = (int16_t)(((int32_t)src[0] + (int32_t)src[1]) >> 1);
+                if(channel_count == 2){
+                    for (size_t i = 0; i < frames ; i++, dst++, src += 2) {
+                        *dst = (int16_t)(((int32_t)src[0] + (int32_t)src[1]) >> 1);
+                    }
+                    bytes_to_write /= 2;
                 }
-                bytes_to_write /= 2;
             }
-
             ALOGVV("%s: writing buffer (%zu bytes) to pcm device", __func__, bytes);
 
             long ns = 0;
@@ -7237,7 +7241,8 @@ static int adev_update_voice_comm_input_stream(struct stream_in *in,
 
 #ifndef COMPRESS_VOIP_ENABLED
     if (valid_rate && valid_ch &&
-        in->dev->mode == AUDIO_MODE_IN_COMMUNICATION) {
+        (in->dev->mode == AUDIO_MODE_IN_COMMUNICATION ||
+         in->source == AUDIO_SOURCE_VOICE_COMMUNICATION)) {
         in->usecase = USECASE_AUDIO_RECORD_VOIP;
         in->config = default_pcm_config_voip_copp;
         in->config.period_size = VOIP_IO_BUF_SIZE(in->sample_rate,
@@ -7253,8 +7258,9 @@ static int adev_update_voice_comm_input_stream(struct stream_in *in,
 #else
     //XXX needed for voice_extn_compress_voip_open_input_stream
     in->config.rate = config->sample_rate;
-    if ((in->dev->mode == AUDIO_MODE_IN_COMMUNICATION ||
-         voice_extn_compress_voip_is_active(in->dev)) &&
+    if((in->dev->mode == AUDIO_MODE_IN_COMMUNICATION ||
+        in->source == AUDIO_SOURCE_VOICE_COMMUNICATION ||
+        voice_extn_compress_voip_is_active(in->dev)) &&
         (voice_extn_compress_voip_is_format_supported(in->format)) &&
         valid_rate && valid_ch) {
         voice_extn_compress_voip_open_input_stream(in);
@@ -7341,6 +7347,10 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->stream.read = in_read;
     in->stream.get_input_frames_lost = in_get_input_frames_lost;
     in->stream.get_active_microphones = in_get_active_microphones;
+#if ANDROID_PLATFORM_SDK_VERSION >= 29
+    in->stream.set_microphone_direction = in_set_microphone_direction;
+    in->stream.set_microphone_field_dimension = in_set_microphone_field_dimension;
+#endif
 
     in->device = devices;
     in->source = source;
@@ -7680,9 +7690,9 @@ static int adev_dump(const audio_hw_device_t *device __unused,
 
 static int adev_close(hw_device_t *device)
 {
-    struct audio_device *adev = (struct audio_device *)device;
+    struct audio_device *adev_temp = (struct audio_device *)device;
 
-    if (!adev)
+    if (!adev_temp)
         return 0;
 
     pthread_mutex_lock(&adev_init_lock);
@@ -7694,10 +7704,12 @@ static int adev_close(hw_device_t *device)
         audio_extn_utils_release_streams_cfg_lists(
                       &adev->streams_output_cfg_list,
                       &adev->streams_input_cfg_list);
+        if (audio_extn_qap_is_enabled())
+            audio_extn_qap_deinit();
         if (audio_extn_qaf_is_enabled())
             audio_extn_qaf_deinit();
         audio_route_free(adev->audio_route);
-        audio_extn_gef_deinit();
+        audio_extn_gef_deinit(adev);
         free(adev->snd_dev_ref_cnt);
         platform_deinit(adev->platform);
         if (adev->adm_deinit)
@@ -7951,6 +7963,21 @@ static int adev_open(const hw_module_t *module, const char *name,
         *device = NULL;
         pthread_mutex_unlock(&adev_init_lock);
         return -EINVAL;
+    }
+
+    if (audio_extn_qap_is_enabled()) {
+        ret = audio_extn_qap_init(adev);
+        if (ret < 0) {
+            pthread_mutex_destroy(&adev->lock);
+            free(adev);
+            adev = NULL;
+            ALOGE("%s: Failed to init platform data, aborting.", __func__);
+            *device = NULL;
+            pthread_mutex_unlock(&adev_init_lock);
+            return ret;
+        }
+        adev->device.open_output_stream = audio_extn_qap_open_output_stream;
+        adev->device.close_output_stream = audio_extn_qap_close_output_stream;
     }
 
     if (audio_extn_qaf_is_enabled()) {
